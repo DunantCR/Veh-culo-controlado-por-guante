@@ -1,0 +1,386 @@
+
+/* Proyecto: Guante controlador de Carrito TIVA
+* Autor: Dunant Cusipuma
+* Semestre: 2019-2
+* Descripción: El programa leerá los valores del magnetóimetro ya calibrado, estos valores no serán usados hasta despues de
+* que el SW1 del Tiva haya sido presionado(presionado y soltado). Una vez ocurrido esto, el tiva enviará datos atravez del UART según
+* según el ángulo, el cual ha sido modificado luego de establecer nuevos ejes para obtener una nueva orientacion deacuerdo a nuestra
+* posicion.
+* El siguiente código tiene partes desarrolladas por Jonathan W. Valvano(Configuración del I2C)
+* Código hallado en http://users.ece.utexas.edu
+* Y Sebastian Jaimes (Configuración del ADC)
+*/
+
+#include <math.h>
+#include <stdint.h>
+#include "tm4c123gh6pm.h"
+
+#define PI 3.14159265
+
+/////////////////////////////////////////////
+#define MAGNETO_SLAVE_ADDR 0x0D // Definimos la dirección del esclavo
+
+#define REGIS_X_1 0x00 //Registros para leer los datos de cada eje
+#define REGIS_X_2 0x01
+#define REGIS_Y_1 0x02
+#define REGIS_Y_2 0x03
+#define REGIS_Z 0x05
+
+#define CTRL_R 0x09  // Regristro dónde se defino cómo usaremos al esclavo
+#define MODE_M 0x01
+#define ODR_M 0x08
+#define RNG_M 0x10
+#define OSR_M 0x40
+
+#define SET_RESET_M 0x01
+///////////DESARROLADO POR Jonathan W. Valvano/////////////////////////////////////////
+
+#define I2C_MCS_ACK             0x00000008  // Data Acknowledge Enable
+#define I2C_MCS_DATACK          0x00000008  // Acknowledge Data
+#define I2C_MCS_ADRACK          0x00000004  // Acknowledge Address
+#define I2C_MCS_STOP            0x00000004  // Generate STOP
+#define I2C_MCS_START           0x00000002  // Generate START
+#define I2C_MCS_ERROR           0x00000002  // Error
+#define I2C_MCS_RUN             0x00000001  // I2C Master Enable
+#define I2C_MCS_BUSY            0x00000001  // I2C Busy
+#define I2C_MCR_MFE             0x00000010  // I2C Master Function Enable
+
+#define MAXRETRIES              5           // number of receive attempts before giving up
+
+// receives one byte from specified slave
+// Note for HMC6352 compass only:
+// Used with 'r' and 'g' commands
+// Note for TMP102 thermometer only:
+// Used to read the top byte of the contents of the pointer register
+//  This will work but is probably not what you want to do.
+int8_t I2C_Recv(int8_t slave){
+  int retryCounter = 1;
+  do{
+    while(I2C0_MCS_R&I2C_MCS_BUSY){};// wait for I2C ready
+    I2C0_MSA_R = (slave<<1)&0xFE;    // MSA[7:1] is slave address
+    I2C0_MSA_R |= 0x01;              // MSA[0] is 1 for receive
+    I2C0_MCS_R = (0
+                        // & ~I2C_MCS_ACK     // negative data ack (last byte)
+                         | I2C_MCS_STOP     // generate stop
+                         | I2C_MCS_START    // generate start/restart
+                         | I2C_MCS_RUN);    // master enable
+    while(I2C0_MCS_R&I2C_MCS_BUSY){};// wait for transmission done
+    retryCounter = retryCounter + 1;        // increment retry counter
+  }                                         // repeat if error
+  while(((I2C0_MCS_R&(I2C_MCS_ADRACK|I2C_MCS_ERROR)) != 0) && (retryCounter <= MAXRETRIES));
+  return (I2C0_MDR_R&0xFF);          // usually returns 0xFF on error
+}
+
+
+// sends one byte to specified slave
+// Note for HMC6352 compass only:
+// Used with 'S', 'W', 'O', 'C', 'E', 'L', and 'A' commands
+//  For 'A' commands, I2C_Recv2() should also be called
+// Note for TMP102 thermometer only:
+// Used to change the pointer register
+// Returns 0 if successful, nonzero if error
+uint32_t I2C_Send1(int8_t slave, uint8_t data1){
+  while(I2C0_MCS_R&I2C_MCS_BUSY){};// wait for I2C ready
+  I2C0_MSA_R = (slave<<1)&0xFE;    // MSA[7:1] is slave address
+  I2C0_MSA_R &= ~0x01;             // MSA[0] is 0 for send
+  I2C0_MDR_R = data1&0xFF;         // prepare first byte
+  I2C0_MCS_R = (0
+                       & ~I2C_MCS_ACK     // no data ack (no data on send)
+                       | I2C_MCS_STOP     // generate stop
+                       | I2C_MCS_START    // generate start/restart
+                       | I2C_MCS_RUN);    // master enable
+  while(I2C0_MCS_R&I2C_MCS_BUSY){};// wait for transmission done
+                                          // return error bits
+  return (I2C0_MCS_R&(I2C_MCS_DATACK|I2C_MCS_ADRACK|I2C_MCS_ERROR));
+}
+
+// sends two bytes to specified slave
+// Note for HMC6352 compass only:
+// Used with 'r' and 'g' commands
+//  For 'r' and 'g' commands, I2C_Recv() should also be called
+// Note for TMP102 thermometer only:
+// Used to change the top byte of the contents of the pointer register
+//  This will work but is probably not what you want to do.
+// Returns 0 if successful, nonzero if error
+
+uint32_t I2C_Send2(int8_t slave, uint8_t data1, uint8_t data2){
+  while(I2C0_MCS_R&I2C_MCS_BUSY){};// wait for I2C ready
+  I2C0_MSA_R = (slave<<1)&0xFE;    // MSA[7:1] is slave address
+  I2C0_MSA_R &= ~0x01;             // MSA[0] is 0 for send
+  I2C0_MDR_R = data1&0xFF;         // prepare first byte
+  I2C0_MCS_R = (0
+                     //  & ~I2C_MCS_ACK     // no data ack (no data on send)
+                    //   & ~I2C_MCS_STOP    // no stop
+                       | I2C_MCS_START    // generate start/restart
+                       | I2C_MCS_RUN);    // master enable
+  while(I2C0_MCS_R&I2C_MCS_BUSY){};// wait for transmission done
+                                          // check error bits
+  if((I2C0_MCS_R&(I2C_MCS_DATACK|I2C_MCS_ADRACK|I2C_MCS_ERROR)) != 0){
+    I2C0_MCS_R = (0                // send stop if nonzero
+                     //  & ~I2C_MCS_ACK     // no data ack (no data on send)
+                       | I2C_MCS_STOP     // stop
+                     //  & ~I2C_MCS_START   // no start/restart
+                     //  & ~I2C_MCS_RUN    // master disable
+                        );
+                                          // return error bits if nonzero
+    return (I2C0_MCS_R&(I2C_MCS_DATACK|I2C_MCS_ADRACK|I2C_MCS_ERROR));
+  }
+  I2C0_MDR_R = data2&0xFF;         // prepare second byte
+  I2C0_MCS_R = (0
+                      // & ~I2C_MCS_ACK     // no data ack (no data on send)
+                       | I2C_MCS_STOP     // generate stop
+                      // & ~I2C_MCS_START   // no start/restart
+                       | I2C_MCS_RUN);    // master enable
+  while(I2C0_MCS_R&I2C_MCS_BUSY){};// wait for transmission done
+                                          // return error bits
+  return (I2C0_MCS_R&(I2C_MCS_DATACK|I2C_MCS_ADRACK|I2C_MCS_ERROR));
+}
+/////////////////////////////////////////////////////////////////////////
+
+#define SW1     (0x10)
+#define VERDE   (0x08)
+#define AZUL    (0x04)
+#define ROJO    (0x02)
+#define SW2     (0x01)
+
+#define MAGENTA    ( AZUL | ROJO )
+#define CIAN       ( AZUL | VERDE )
+#define AMARILLO   ( ROJO | VERDE )
+#define BLANCO     ( ROJO | AZUL | VERDE )
+
+void config_pulsador_led(void){
+
+    SYSCTL_RCGCGPIO_R |= SYSCTL_RCGCGPIO_R5;// Activamos la señal de reloj del puerto F
+    while( (SYSCTL_PRGPIO_R & SYSCTL_PRGPIO_R5)==0); // esperamos a que realmente se active
+    // SW1 está conectado al pin PF4, SW2 está conectado al pin PF0, led rojo a PF1, led azul a PF2 y led azul a PF3
+
+    GPIO_PORTF_LOCK_R = 0x4C4F434B; // Desbloqueamos en el puerto PF0
+    GPIO_PORTF_CR_R = 0x01;
+    GPIO_PORTF_DIR_R |=0x0E; //PF1,PF2 y PF3 como salidas
+    GPIO_PORTF_DIR_R &= ~0x11; // PF0 y PF4 como entrada
+    GPIO_PORTF_AFSEL_R &= ~(0x1F); // No utilizar funciones alternas
+    GPIO_PORTF_AMSEL_R &= ~(0x1F); // No utilizar modo analógico
+    GPIO_PORTF_DR8R_R |= 0x0E; // Activar driver de 8mA para los leds
+    GPIO_PORTF_PCTL_R = (GPIO_PORTF_PCTL_R&0xFFF00000)| 0x00000000; //Configuramos para que los pines funcionen con GPIO
+    GPIO_PORTF_PUR_R |= 0x11;// Activar resistencias de pull-up en pines PF0 yPF4
+    GPIO_PORTF_DEN_R |= 0x1F; // Habilitar pines PA5, PA4, PA3 y PA2 en funcion digital
+    GPIO_PORTF_DATA_R &= ~(0x0E); //Apagamos los leds para empezar
+}
+
+//Funcion de configuración del UART
+void config_UART3(void){
+    SYSCTL_RCGCUART_R |= (1<<3); //Activamos la seña del UART
+    while((SYSCTL_PRUART_R & 0x08)==0){} //esperamos que realmente se active el reloj del uart
+    SYSCTL_RCGCGPIO_R |= (1<<2); // activamos señal del puerto C para usarlo cómo UART
+    while((SYSCTL_PRGPIO_R & 0x04)==0){} // esperamos que realmente se active
+
+    GPIO_PORTC_AFSEL_R |= (1<<7) | (1<<6); // señal PC6(Rx) y PC7(Tx) como entrada
+    GPIO_PORTC_PCTL_R |= (1<<28) | (1<<24); // indicamos que se usara como UART
+    GPIO_PORTC_DEN_R |= (1<<7) | (1<<6); // habilitamos señal digital
+
+
+    //UART Configuration
+
+    //BRD = 16,000,000 / (16 * 38400) = 26.0416667
+    //UARTFBRD[DIVFRAC] = integer(0.0416667 * 64 + 0.8) = 3
+
+    UART3_CTL_R  &= ~(1<<0);             //Disable Uart
+    UART3_IBRD_R = 26; // numero obtenido por la velocidad a la de 16, 000, 000
+    UART3_FBRD_R = 3;
+    UART3_LCRH_R |= (7<<4); // por ser 8 caracteres por bit WLEN= 11
+    UART3_CC_R = 0x0;   //Clock Configuration
+    UART3_CTL_R = (1<<0)| (1<<8) | (1<<9); // habilitamos Rx y TX del UART3
+}
+//Función para la transmisión de un caracter
+void txcar_uart3(uint32_t car){
+    while ((UART3_FR_R & UART_FR_TXFF)!=0); //Espera que esté disponible para transmitir
+    UART3_DR_R = car;
+}
+
+//Función para la recepción de un carácter de 8 bits/
+uint8_t rxcar_uart3(void){
+    uint8_t temp;
+    while ((UART3_FR_R & UART_FR_RXFE)!=0); // Se espera que llegue un dato
+    temp= UART3_DR_R&0xFF; // Se toman solo 8 bits
+    return temp;
+}
+
+//Funcion para el envio de una cadena
+void txmens_uart3(uint8_t mens[]){
+    uint8_t letra;
+    uint8_t i=0;
+    letra= mens[i++];
+    while (letra != '\0'){ //Se envían todos los caracteres hasta el fin de cadena
+        txcar_uart3(letra);
+        letra= mens[i++];
+    }
+}
+void Config_ADC(void){// CONFIGURACIÓN DEL ADC
+
+   SYSCTL_RCGCGPIO_R |= SYSCTL_RCGCGPIO_R4;// ACTIVAMOS LA SEÑAL DE RELOJ DEL PUERTO E
+   while ((SYSCTL_PRGPIO_R & SYSCTL_PRGPIO_R4)==0);// ESPERAMOS A QUE SE ACTIVE EL RELOJ
+   GPIO_PORTE_DIR_R &= ~(1<<2);// PIN PE2 COMO ENTRADA
+   GPIO_PORTE_AFSEL_R |= (1<<2);// HABILITAMOS LA FUNCION ALTERNATIVA DEL PIN PE2
+   GPIO_PORTE_DEN_R &= ~(1<<2);// DESHABILITAMOS EL PIN PE2 COMO SEÑAL DIGITAL
+   GPIO_PORTE_AMSEL_R |= (1<<2);// HABILITAMOS EL PIN PE2 COMO SEÑAL ANALÓGICA
+// AQUÍ SE TERMINA DE CONFIGURAR EL PIN PE2 COMO ENTRADA ANALÓGICA
+
+// SE CONFIGURA EL ADC
+   SYSCTL_RCGC0_R |= (1<<16);// ACTIVAMOS LA SEÑAL DE RELOJ DEL ADC0 (BIT 16)
+   SYSCTL_RCGC0_R &= ~((1<<8)|(1<<9));// SE CONFIGURA LA VELOCIDAD DE MUESTREO COMO 125K MUESTAS POR SEGUNDO
+
+   ADC0_SSPRI_R |= 0x123;// CONFIGURAMOS EL SECUENCIADOS 3 COMO MÁXIMA PRIORIDAD ESCRIBIENDO O EN LOS BITS 12 Y 13
+   ADC0_SSPRI_R &= ~0x3210;// Y LOS DEMAS SECUENCIADORES CON MENOR PRIORIDAD
+   ADC0_ACTSS_R &= ~(1<<3);// DESHABILITAMOS EL SECUENCIADOR 3
+
+   ADC0_EMUX_R &= ~0xF000;// SE CONFIGURA EL EVENTO DE TRIGGER POR SOWTWARE Y EN MODO CONTINUO
+   ADC0_SSMUX3_R &= ~((1<<1)|(1<<2)|(1<<3));// SE LIMPIAN LAS BANDERAS DE LOS BITS 1, 2 Y 3
+   ADC0_SSMUX3_R |= (1<<0);// ACTIVAMOS EL CANAL AIN1 QUE CORRESPONDE AL TERMINAL FÍSICO DEL PE2
+   ADC0_SSCTL3_R &= ~((1<<3)|(1<<0));// LIMPIAR LA BANDERA DE INTERRUPCIÓN
+   ADC0_SSCTL3_R |= ((1<<1)|(1<<2));// HABILITAR INTERRUPCIÓN  Y HABILITAMOS FINAL DE SECUENCIA (BIT END0)
+   ADC0_ACTSS_R |= (1<<3);//HABILITAMOS EL SECUENCIADOR 3
+}
+
+uint32_t ADC0_capture(void){ // FUNCIÓN PARA LEER EL DATO
+    uint32_t resultado;
+    ADC0_PSSI_R = 0x08; // INICIALIZAMOS EL SECUENCIADOR 3, SE ACTIVA EL EVENTO DE TRIGGER, EMPIEZA A
+    //CAPTURAR POR SOFTWARE A TRAVES DEL REGISTRO PSSI
+    while ((ADC0_RIS_R & 0x08)==0); // ESPERTAMOS HASTA A QUE LA CONVERSIÓN ESTÉ COMPLETA
+    //(SI EL BIT INR 3 VALE 1 - LA CONVERSIÓN TERMINÓ EXITOSAMENTE)
+    resultado = ADC0_SSFIFO3_R & 0xFFF; // LEEMOS EL RESULTADO
+    ADC0_ISC_R = 0x08;
+    return resultado;
+}
+
+uint8_t Determinar_estado_flex(void){ // Función que nos permite saber entre qué valores está el ADC para obtener el estado que queremos
+    uint32_t valor, i;
+    uint8_t estado_flex;
+
+    valor = ADC0_capture(); // Captura el valor del sensor flex
+    if (valor > 900){
+        estado_flex = 2;
+    }
+    else if ((valor < 900)&&(valor > 100)){
+        estado_flex = 0;
+    }
+
+    return estado_flex;
+}
+
+uint8_t Read_Eje_1(uint8_t slave, uint8_t reg_x_y, uint8_t reg_z){//Funcion para la lectura de un dato de 8 bits del regitro de los ejes
+    uint32_t trash;
+    trash = I2C_Send1(slave, reg_x_y); //Le damos los regritos que queremos leer
+
+    uint8_t eje_x_y;
+    eje_x_y = I2C_Recv(slave); // Lee el registro ya escogido del slave
+
+    //Tenemos que leer siempre el dato que queremos y el ultimo de los registros, para que se limpien y puedan registrarse otros luego
+    trash = I2C_Send1(slave, reg_z);
+    trash = I2C_Recv(slave);
+
+    return (eje_x_y&0xFF);
+}
+
+double division(int a,int b) { //Función division para evitar el caso de una division por CERO
+    if(b != 0) {return (double)a/b;}
+    else {
+        return -1;
+    }
+    return 0;
+}
+
+void main (void){
+
+    uint32_t var1;
+    var1 = I2C_Send2( MAGNETO_SLAVE_ADDR, 0x0B , SET_RESET_M ); //Reseteamos el magnetómetro
+    uint32_t var2;
+    var2 = I2C_Send2( MAGNETO_SLAVE_ADDR, CTRL_R, (MODE_M|ODR_M|RNG_M|OSR_M) );//Escogemos el modo de lectura de los datos del magnetómetro
+
+    config_pulsador_led();
+    config_UART3();
+    Config_ADC();
+    uint8_t eje_x_1_save = 0; //variables para guardas los datos hallados del magnetómetro
+    uint8_t eje_x_2_save = 0;
+
+    uint8_t eje_y_1_save = 0;
+    uint8_t eje_y_2_save = 0;
+
+    int16_t eje_x = 0; //Union del valor de los 2 datos de 8bits que cada eje
+    int16_t eje_y = 0;
+
+    int atana ; // Variable dónde se guardará el angulo convertido de radianes a grados
+    double atanaprevio; // Variable dónde se guardará el ángulo
+
+    uint8_t prendido=0;
+    while (1) {
+
+        while (prendido==0){
+            eje_x_1_save = Read_Eje_1 (MAGNETO_SLAVE_ADDR, REGIS_X_1, REGIS_Z); //Se lee el dato de 8bits LSB del eje X
+            eje_x_2_save = Read_Eje_1 (MAGNETO_SLAVE_ADDR, REGIS_X_2, REGIS_Z); //Se lee el dato de 8bits MSB del eje X
+
+            eje_x = ((eje_x_2_save<<8)|eje_x_1_save)-122; // Calibración del eje X
+
+            eje_y_1_save = Read_Eje_1 (MAGNETO_SLAVE_ADDR, REGIS_Y_1, REGIS_Z); //Se lee el dato de 8bits LSB del eje Y
+            eje_y_2_save = Read_Eje_1 (MAGNETO_SLAVE_ADDR, REGIS_Y_2, REGIS_Z); //Se lee el dato de 8bits MSB del eje Y
+
+            eje_y = ((eje_y_2_save<<8)|eje_y_1_save)+651; // Calibración del eje Y
+
+            atanaprevio = atan2(eje_y, eje_x); //Hallamos el ángulo en nuestra posicion real
+            atana = (atanaprevio)*180/PI; //Ángulo convertido de radianes a grados
+
+            if ((GPIO_PORTF_DATA_R&SW1)==0){ //Si se precionó el SW1
+                while(!((GPIO_PORTF_DATA_R&SW1)==SW1)){}; // Mientras no se suelte el SW1
+                prendido=1;
+            } else {prendido=0;
+
+            }
+
+        }
+        while(prendido==1){//Una vez que se presionó el SW1 empezará a enviar datos atravez del UART
+
+
+            uint8_t flag = Determinar_estado_flex(); //para saber cual es el estado del sensor flex, Yq que este tiene prioridad
+
+            while(flag==2){// Si el sensor flex esta en el rango establecido enviará el dato para que avance el vehículo
+                txcar_uart3('v');
+                GPIO_PORTF_DATA_R |= AMARILLO;//prendemos el led amarillo para saber en qué estado está
+                flag = Determinar_estado_flex(); //volemos a preguntar por el estado del sensor flex para salir del bucle
+            }
+            int16_t eje_x_rotate; //Variale para guardar los ejes rotados
+            int16_t eje_y_rotate;
+            //Se lee nuevamente el valor delos ejes para rotarlos
+            eje_x_1_save = Read_Eje_1 (MAGNETO_SLAVE_ADDR, REGIS_X_1, REGIS_Z);
+            eje_x_2_save = Read_Eje_1 (MAGNETO_SLAVE_ADDR, REGIS_X_2, REGIS_Z);
+
+            eje_x = ((eje_x_2_save<<8)|eje_x_1_save)-130;
+
+            eje_y_1_save = Read_Eje_1 (MAGNETO_SLAVE_ADDR, REGIS_Y_1, REGIS_Z);
+            eje_y_2_save = Read_Eje_1 (MAGNETO_SLAVE_ADDR, REGIS_Y_2, REGIS_Z);
+
+            eje_y = ((eje_y_2_save<<8)|eje_y_1_save)+577;
+
+            eje_x_rotate = ((eje_x*cos(atanaprevio)) + (eje_y*sin(atanaprevio)));
+            eje_y_rotate = (-(eje_x*sin(atanaprevio)) + (eje_y*cos(atanaprevio)));
+
+
+            atana = (atan2(eje_y_rotate, eje_x_rotate))*180/PI; // Hallamos el nuevo ángulo segun nuestros ejes rotados
+
+            GPIO_PORTF_DATA_R &= ~BLANCO;
+
+            if ((atana<135)&&(atana>45)){//Mandamos el comando para saber que es un giro a la DERECHA
+                txcar_uart3('r');
+                GPIO_PORTF_DATA_R |= ROJO;//Prendemos el led ROJO para saber a que se está enviando la senal de giro a la DERECHA
+            }else if (((atana>-135)&&(atana<-45))){//Mandamos el comando para saber que es un giro a la IZQUIERDA
+                txcar_uart3('g');
+                GPIO_PORTF_DATA_R |= AZUL;//Prendemos el led AZUL para saber a que se está enviando la senal de giro a la IZQUIERDA
+            }else txcar_uart3('z'); // Si no es ninguno se envia la señal para detener el vehículo
+
+            if ((GPIO_PORTF_DATA_R&SW1)==0){//Si se precionó el SW1 para regresar al estado en el que no envia ningun comando
+                while(!((GPIO_PORTF_DATA_R&SW1)==SW1)){};// Espera que sea soltado
+                prendido=0;
+            } else {prendido=1;
+
+            }
+        }
+    }
+}
