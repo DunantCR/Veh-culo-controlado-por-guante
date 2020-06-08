@@ -1,0 +1,341 @@
+
+/* Proyecto: Guante controlador de Carrito TIVA
+* Autores: Sebastian Jaimes, Dunant Cusipuma
+* Semestre: 2019-2
+* Descripción: El programa recibirá un valor transmitido por UART. Una vez recibido
+* el vehículo realizará la acción que le corresponde, ya sea avanzar, girar a la derecha o a la izquierda.
+* El siguiente código tiene partes desarrolladas por Miguel Angel(Configuración del módulo PWM)
+* Código adaptado de su video tutorial.
+* Y Dunant Cusipuma (Configuración del UART y Main)
+*/
+
+#include "tm4c123gh6pm.h"
+#include "stdint.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+#define SW1     (0x10)
+#define VERDE   (0x08)
+#define AZUL    (0x04)
+#define ROJO    (0x02)
+#define SW2     (0x01)
+
+#define MAGENTA    ( AZUL | ROJO )
+#define CIAN       ( AZUL | VERDE )
+#define AMARILLO   ( ROJO | VERDE )
+#define BLANCO     ( ROJO | AZUL | VERDE )
+
+void config_pulsador_led(void){
+
+    SYSCTL_RCGCGPIO_R |= SYSCTL_RCGCGPIO_R5;// Activamos la señal de reloj del puerto F
+    while( (SYSCTL_PRGPIO_R & SYSCTL_PRGPIO_R5)==0); // esperamos a que realmente se active
+    // SW1 está conectado al pin PF4, SW2 está conectado al pin PF0, led rojo a PF1, led azul a PF2 y led azul a PF3
+
+    GPIO_PORTF_LOCK_R = 0x4C4F434B; // Desbloqueamos en el puerto PF0
+    GPIO_PORTF_CR_R = 0x01;
+    GPIO_PORTF_DIR_R |=0x0E; //PF1,PF2 y PF3 como salidas
+    GPIO_PORTF_DIR_R &= ~0x11; // PF0 y PF4 como entrada
+    GPIO_PORTF_AFSEL_R &= ~(0x1F); // No utilizar funciones alternas
+    GPIO_PORTF_AMSEL_R &= ~(0x1F); // No utilizar modo analógico
+    GPIO_PORTF_DR8R_R |= 0x0E; // Activar driver de 8mA para los leds
+    GPIO_PORTF_PCTL_R = (GPIO_PORTF_PCTL_R&0xFFF00000)| 0x00000000; //Configuramos para que los pines funcionen con GPIO
+    GPIO_PORTF_PUR_R |= 0x11;// Activar resistencias de pull-up en pines PF0 yPF4
+    GPIO_PORTF_DEN_R |= 0x1F; // Habilitar pines PA5, PA4, PA3 y PA2 en funcion digital
+    GPIO_PORTF_DATA_R &= ~(0x0E); //Apagamos los leds para empezar
+}
+
+void config_UART3(void){
+    SYSCTL_RCGCUART_R |= (1<<3); //Activamos la seña del UART
+    while((SYSCTL_PRUART_R & 0x08)==0){} //esperamos que realmente se active el reloj del uart
+    SYSCTL_RCGCGPIO_R |= (1<<2); // activamos señal del puerto C para usarlo cómo UART
+    while((SYSCTL_PRGPIO_R & 0x04)==0){} // esperamos que realmente se active
+
+    GPIO_PORTC_AFSEL_R |= (1<<7) | (1<<6); // señal PC6(Rx) y PC7(Tx) como entrada
+    GPIO_PORTC_PCTL_R |= (1<<28) | (1<<24); // indicamos que se usaára como UART
+    GPIO_PORTC_DEN_R |= (1<<7) | (1<<6); // habilitamos señal digital
+
+
+    //UART Configuration
+
+        //BRD = 16,000,000 / (16 * 9600) = 104.16666
+        //UARTFBRD[DIVFRAC] = integer(0.16667 * 64 + 0.8) = 11
+
+        UART3_CTL_R  &= ~(1<<0);             //Disable Uart
+        UART3_IBRD_R = 26; // numero obtenido por la velocidad a la de 16, 000, 000
+        UART3_FBRD_R = 3;
+        UART3_LCRH_R |= (7<<4); // por ser 8 caracteres por bit WLEN= 11
+        //UART3_LCRH_R &= ~(1<<3);
+        UART3_CC_R = 0x0;   //Clock Configuration
+
+        UART3_CTL_R = (1<<0)| (1<<8) | (1<<9); // habilitamos Rx y TX del UART3
+
+
+}
+
+//Función para la recepción de un carácter de 8 bits/
+uint8_t rxcar_uart3(void){
+    uint8_t temp;
+    while ((UART3_FR_R & UART_FR_RXFE)!=0); // Se espera que llegue un dato
+    temp= UART3_DR_R&0xFF; // Se toman solo 8 bits
+    return temp;
+}
+
+void delay (int time){
+
+    uint32_t i;
+    for (i=0; i<time; i++);
+
+}
+
+void delayms(uint32_t x){
+    uint32_t a;
+    for( a = 0 ; a < x; a++);
+}
+
+void configura_pwm_M1_PB4(void){
+    SYSCTL_RCGCPWM_R |= (1<<0);  /* habilitamos el clock para el modulo PWM0 (bit R0 de RCGCPWM) */
+    while(!(SYSCTL_PRPWM_R & SYSCTL_PRPWM_R0));// esperamos a que se active la señal de reloj del módulo PWM0
+
+    SYSCTL_RCGCGPIO_R |= (1<<1);   /* habilitamos el clock del puerto B () */
+    while(!(SYSCTL_PRGPIO_R & SYSCTL_PRGPIO_R1));// esperamos a que se active la señal de reloj del puerto B
+    SYSCTL_RCC_R &= ~(1<<20); /* sin pre escalador para el clock del pwm (bit 20 USEPWMDIV de RCC */
+    GPIO_PORTB_DIR_R |= (1<<4); // definimos el pin PB4 como salida
+    /* habilitamos la funcion alternativa para PB4 (M0PWM2) */
+    GPIO_PORTB_AFSEL_R |= (1<<4); /* habilitamos funcion alternativa para PB4 */
+    GPIO_PORTB_PCTL_R = (GPIO_PORTB_PCTL_R & ~(0x000F0000))|(0x00040000); /* valor para usar el pin PB4 como M0PWM2 */
+    GPIO_PORTB_AMSEL_R &= ~(1<<4); //deshabilitamos el pin analógico
+    GPIO_PORTB_DEN_R |= (1<<4);  /* habilitamos pin PB4 como pin digital */
+
+    PWM0_3_CTL_R&=~(1<<0);       /* deshabilitamos el conteo (bit 0 de PWM0CTL) */
+    PWM0_3_GENB_R = 0x0000008C;  /* configuramos para generar la señal PWM con el generador 3 salida B y usando el comparador A*/
+                                 /* Teniendo un contador descedente, cuando el contador llegue a un valor igual */
+                                 /* al valor del comparador A, la señal pwm se pondrá en LOW (bits D3D2 del registro PWM0GENB 11=0x3) */
+                                 /* luego cuando el valor del contador llegue a 0,la señal PWM se pondra en HIGH (bits D7D6 de PWM0GENB 10=0x2)*/
+                                 /* con esto el valor de PWM0GENB es 0x8C*/
+    PWM0_INVERT_R |= (1<<2);
+    PWM0_3_LOAD_R = 16000;       /* valor tope para Fpwm = 1KHZ-> valor_tope=(16000000Hz/1000)=16000  */
+    PWM0_3_CMPA_R = 8000;        /* iniciamos con el valor minimo dt =50 */
+    PWM0_3_CTL_R  = 1;           /* activamos el contador del modulo PWM0 */
+    PWM0_ENABLE_R = (1<<2);      /* activamos la salida pwm2pin (que corresponde a PB4) del Modulo PWM0 */
+    // hacemos un retardo para que un inicio nos muestre la señal con DC=50%
+    delayms(5000);
+    //delayms(5000);
+}
+
+void configura_pwm_M2_PE5(void){
+    SYSCTL_RCGCPWM_R |= (1<<0);  /* habilitamos el clock para el modulo PWM0 (bit R0 de RCGCPWM) */
+    while(!(SYSCTL_PRPWM_R & SYSCTL_PRPWM_R0));// esperamos a que se active la señal de reloj del módulo PWM0
+
+    SYSCTL_RCGCGPIO_R |= (1<<4);   /* habilitamos el clock del puerto E () */
+    while(!(SYSCTL_PRGPIO_R & SYSCTL_PRGPIO_R4));// esperamos a que se active la señal de reloj del puerto E
+    SYSCTL_RCC_R &= ~(1<<20); /* sin pre escalador para el clock del pwm (bit 20 USEPWMDIV de RCC */
+    GPIO_PORTE_DIR_R |= (1<<5); // definimos el pin PE5 como salida
+    /* habilitamos la funcion alternativa para PE5 (M0PWM5) */
+    GPIO_PORTE_AFSEL_R |= (1<<5); /* habilitamos funcion alternativa para PE5 */
+    GPIO_PORTE_PCTL_R = (GPIO_PORTE_PCTL_R & ~(0x00F00000))|(0x00400000); /* valor para usar el pin PE5 como M0PWM5 */
+    GPIO_PORTE_AMSEL_R &= ~(1<<5); //deshabilitamos el pin analógico
+    GPIO_PORTE_DEN_R |= (1<<5);  /* habilitamos pin PE5 como pin digital */
+
+    PWM0_2_CTL_R&=~(1<<0);       /* deshabilitamos el conteo (bit 0 de PWM0CTL) */
+    PWM0_2_GENB_R = 0x0000008C;  /* configuramos para generar la señal PWM con el generador 2 salida B y usando el comparador A*/
+                                 /* Teniendo un contador descedente, cuando el contador llegue a un valor igual */
+                                 /* al valor del comparador A, la señal pwm se pondrá en LOW (bits D3D2 del registro PWM0GENB 11=0x3) */
+                                 /* luego cuando el valor del contador llegue a 0,la señal PWM se pondra en HIGH (bits D7D6 de PWM0GENB 10=0x2)*/
+                                 /* con esto el valor de PWM0GENB es 0x8C*/
+    PWM0_INVERT_R |= (1<<5);
+    PWM0_2_LOAD_R = 16000;       /* valor tope para Fpwm = 1KHZ-> valor_tope=(16000000Hz/1000)=16000  */
+    PWM0_2_CMPA_R = 8000;        /* iniciamos con el valor minimo dt =50 */
+    PWM0_2_CTL_R  = 1;           /* activamos el contador del modulo PWM0 */
+    PWM0_ENABLE_R = (1<<5);      /* activamos la salida pwm5pin (que corresponde a PE5) del Modulo PWM0 */
+    // hacemos un retardo para que un inicio nos muestre la señal con DC=50%
+    delayms(5000);
+    //delayms(5000);
+}
+
+void configura_pwm_M3_PB6(void){
+    SYSCTL_RCGCPWM_R |= (1<<0);  /* habilitamos el clock para el modulo PWM0 (bit R0 de RCGCPWM) */
+    while(!(SYSCTL_PRPWM_R & SYSCTL_PRPWM_R0));// esperamos a que se active la señal de reloj del módulo PWM0
+
+    SYSCTL_RCGCGPIO_R |= (1<<1);   /* habilitamos el clock del puerto B () */
+    while(!(SYSCTL_PRGPIO_R & SYSCTL_PRGPIO_R1));// esperamos a que se active la señal de reloj del puerto B
+    SYSCTL_RCC_R &= ~(1<<20); /* sin pre escalador para el clock del pwm (bit 20 USEPWMDIV de RCC */
+    GPIO_PORTB_DIR_R |= (1<<6); // definimos el pin PB6 como salida
+    /* habilitamos la funcion alternativa para PB6 (M0PWM0) */
+    GPIO_PORTB_AFSEL_R |= (1<<6); /* habilitamos funcion alternativa para PB6 */
+    GPIO_PORTB_PCTL_R = (GPIO_PORTB_PCTL_R & ~(0x0F000000))|(0x04000000); /* valor para usar el pin PB6 como M0PWM0 */
+    GPIO_PORTB_AMSEL_R &= ~(1<<6); //deshabilitamos el pin analógico
+    GPIO_PORTB_DEN_R |= (1<<6);  /* habilitamos pin PB6 como pin digital */
+
+    PWM0_1_CTL_R&=~(1<<0);       /* deshabilitamos el conteo (bit 0 de PWM0CTL) */
+    PWM0_1_GENB_R = 0x0000008C;  /* configuramos para generar la señal PWM con el generador 3 salida B y usando el comparador A*/
+                                 /* Teniendo un contador descedente, cuando el contador llegue a un valor igual */
+                                 /* al valor del comparador A, la señal pwm se pondrá en LOW (bits D3D2 del registro PWM0GENB 11=0x3) */
+                                 /* luego cuando el valor del contador llegue a 0,la señal PWM se pondra en HIGH (bits D7D6 de PWM0GENB 10=0x2)*/
+                                 /* con esto el valor de PWM0GENB es 0x8C*/
+    PWM0_INVERT_R |= (1<<0);
+    PWM0_1_LOAD_R = 16000;       /* valor tope para Fpwm = 1KHZ-> valor_tope=(16000000Hz/1000)=16000  */
+    PWM0_1_CMPA_R = 8000;        /* iniciamos con el valor minimo dt =50 */
+    PWM0_1_CTL_R  = 1;           /* activamos el contador del modulo PWM0 */
+    PWM0_ENABLE_R = (1<<0);      /* activamos la salida pwm0pin (que corresponde a PB4) del Modulo PWM0 */
+    // hacemos un retardo para que un inicio nos muestre la señal con DC=50%
+    //delayms(5000);
+    //delayms(5000);
+}
+
+void configura_pwm_M4_PB7(void){
+    SYSCTL_RCGCPWM_R |= (1<<0);  /* habilitamos el clock para el modulo PWM0 (bit R0 de RCGCPWM) */
+    while(!(SYSCTL_PRPWM_R & SYSCTL_PRPWM_R0));// esperamos a que se active la señal de reloj del módulo PWM0
+
+    SYSCTL_RCGCGPIO_R |= (1<<1);   /* habilitamos el clock del puerto B () */
+    while(!(SYSCTL_PRGPIO_R & SYSCTL_PRGPIO_R1));// esperamos a que se active la señal de reloj del puerto B
+    SYSCTL_RCC_R &= ~(1<<20); /* sin pre escalador para el clock del pwm (bit 20 USEPWMDIV de RCC */
+    GPIO_PORTB_DIR_R |= (1<<7); // definimos el pin PB7 como salida
+    /* habilitamos la funcion alternativa para PB6 (M0PWM1) */
+    GPIO_PORTB_AFSEL_R |= (1<<7); /* habilitamos funcion alternativa para PB7 */
+    GPIO_PORTB_PCTL_R = (GPIO_PORTB_PCTL_R & ~(0xF0000000))|(0x40000000); /* valor para usar el pin PB7 como M0PWM1 */
+    GPIO_PORTB_AMSEL_R &= ~(1<<7); //deshabilitamos el pin analógico
+    GPIO_PORTB_DEN_R |= (1<<7);  /* habilitamos pin PB7 como pin digital */
+
+    PWM0_0_CTL_R&=~(1<<0);       /* deshabilitamos el conteo (bit 0 de PWM0CTL) */
+    PWM0_0_GENB_R = 0x0000008C;  /* configuramos para generar la señal PWM con el generador 3 salida B y usando el comparador A*/
+                                 /* Teniendo un contador descedente, cuando el contador llegue a un valor igual */
+                                 /* al valor del comparador A, la señal pwm se pondrá en LOW (bits D3D2 del registro PWM0GENB 11=0x3) */
+                                 /* luego cuando el valor del contador llegue a 0,la señal PWM se pondra en HIGH (bits D7D6 de PWM0GENB 10=0x2)*/
+                                 /* con esto el valor de PWM0GENB es 0x8C*/
+    PWM0_INVERT_R |= (1<<1);
+    PWM0_0_LOAD_R = 16000;       /* valor tope para Fpwm = 1KHZ-> valor_tope=(16000000Hz/1000)=16000  */
+    PWM0_0_CMPA_R = 8000;        /* iniciamos con el valor minimo dt =50 */
+    PWM0_0_CTL_R  = 1;           /* activamos el contador del modulo PWM0 */
+    PWM0_ENABLE_R = (1<<1);      /* activamos la salida pwm0pin (que corresponde a PB4) del Modulo PWM0 */
+    // hacemos un retardo para que un inicio nos muestre la señal con DC=50%
+    delayms(5000);
+    //delayms(5000);
+}
+
+void Config_Sentido_Giro(void){
+    //PUERTO A
+     SYSCTL_RCGCGPIO_R |= SYSCTL_RCGCGPIO_R0;// ACTIVAMOS LA SEÑAL DE RELOJ DEL PUERTO A
+     while ((SYSCTL_PRGPIO_R & SYSCTL_PRGPIO_R0)==0);// ESPERAMOS A QUE SE ACTIVE EL RELOJ
+     GPIO_PORTA_DIR_R |= ((1<<2)|(1<<3)|(1<<4)|(1<<5)|(1<<6)|(1<<7));// PIN PA2, PA3, PA4, PA5, PA6, PA7 COMO SALIDAS
+     GPIO_PORTA_AFSEL_R &= ~((1<<2)|(1<<3)|(1<<4)|(1<<5)|(1<<6)|(1<<7));// DESHABILITAMOS LA FUNCION ALTERNATIVA DEL PIN PA2, PA3, PA4, PA5, PA6, PA7
+     GPIO_PORTA_DEN_R |= ((1<<2)|(1<<3)|(1<<4)|(1<<5)|(1<<6)|(1<<7));// HABILITAMOS EL PIN PA2, PA3, PA4, PA5, PA6, PA7 COMO SEÑAL DIGITAL
+     GPIO_PORTA_AMSEL_R &= ~((1<<2)|(1<<3)|(1<<4)|(1<<5)|(1<<6)|(1<<7));// DESHABILITAMOS EL PIN PA2, PA3, PA4, PA5, PA6, PA7 COMO SEÑAL ANALÓGICA
+     GPIO_PORTA_DATA_R &= ~((1<<2)|(1<<3)|(1<<4)|(1<<5)|(1<<6)|(1<<7));
+    //PUERTO D
+     SYSCTL_RCGCGPIO_R |= SYSCTL_RCGCGPIO_R3;// ACTIVAMOS LA SEÑAL DE RELOJ DEL PUERTO A
+     while ((SYSCTL_PRGPIO_R & SYSCTL_PRGPIO_R3)==0);// ESPERAMOS A QUE SE ACTIVE EL RELOJ
+     GPIO_PORTD_DIR_R |= ((1<<6)|(1<<7));// PIN PA6, PA7 COMO SALIDAS
+     GPIO_PORTD_AFSEL_R &= ~((1<<6)|(1<<7));// DESHABILITAMOS LA FUNCION ALTERNATIVA DEL PIN PA6, PA7
+     GPIO_PORTD_DEN_R |= ((1<<6)|(1<<7));// HABILITAMOS EL PIN PA6, PA7 COMO SEÑAL DIGITAL
+     GPIO_PORTD_AMSEL_R &= ~((1<<6)|(1<<7));// DESHABILITAMOS EL PIN PA6, PA7 COMO SEÑAL ANALÓGICA
+     GPIO_PORTD_DATA_R &= ~((1<<6)|(1<<7));
+
+}
+
+void Motor_avanzar(void){
+    GPIO_PORTA_DATA_R |= (1<<2);//motor derecho delantero
+    GPIO_PORTA_DATA_R &= ~(1<<3);
+
+    GPIO_PORTA_DATA_R |= (1<<4);//motor izquierdo delantero
+    GPIO_PORTA_DATA_R &= ~(1<<5);
+
+    GPIO_PORTA_DATA_R |= (1<<6);//motor derecho trasero
+    GPIO_PORTA_DATA_R &= ~(1<<7);
+
+    GPIO_PORTD_DATA_R |= (1<<6);//motor izquierdo trasero
+    GPIO_PORTD_DATA_R &= ~(1<<7);
+}
+
+void Motor_apagado (void){
+    GPIO_PORTA_DATA_R &= ~(1<<2);//motor derecho delantero
+    GPIO_PORTA_DATA_R &= ~(1<<3);
+
+    GPIO_PORTA_DATA_R &= ~(1<<4);//motor izquierdo delantero
+    GPIO_PORTA_DATA_R &= ~(1<<5);
+
+    GPIO_PORTA_DATA_R &= ~(1<<6);//motor derecho trasero
+    GPIO_PORTA_DATA_R &= ~(1<<7);
+
+    GPIO_PORTD_DATA_R &= ~(1<<6);//motor izquierdo trasero
+    GPIO_PORTD_DATA_R &= ~(1<<7);
+}
+
+void Motor_izq_90(void){//se hacen girar las ruedas derechas hacia adelante y las izquierdas hacia atrás para que gire en su propio eje
+    GPIO_PORTA_DATA_R &= ~(1<<3);
+    GPIO_PORTA_DATA_R |= (1<<2);//motor derecho delantero
+
+    GPIO_PORTA_DATA_R &= ~(1<<4);//motor izquierdo delantero
+    GPIO_PORTA_DATA_R |= (1<<5);
+
+    GPIO_PORTA_DATA_R &= ~(1<<7);
+    GPIO_PORTA_DATA_R |= (1<<6);//motor derecho trasero
+
+    GPIO_PORTD_DATA_R &= ~(1<<6);//motor izquierdo trasero
+    GPIO_PORTD_DATA_R |= (1<<7);
+
+}
+
+void Motor_der_90(void){//se hacen girar las ruedas izquierdas hacia adelante y las derechas hacia atrás para que gire en su propio eje
+    GPIO_PORTA_DATA_R &= ~(1<<2);//motor derecho delantero
+    GPIO_PORTA_DATA_R |= (1<<3);
+
+    GPIO_PORTA_DATA_R |= (1<<4);//motor izquierdo delantero
+    GPIO_PORTA_DATA_R &= ~(1<<5);
+
+    GPIO_PORTA_DATA_R &= ~(1<<6);//motor derecho trasero
+    GPIO_PORTA_DATA_R |= (1<<7);
+
+    GPIO_PORTD_DATA_R |= (1<<6);//motor izquierdo trasero
+    GPIO_PORTD_DATA_R &= ~(1<<7);
+}
+
+void main(){
+
+    configura_pwm_M1_PB4();//motor derecho delantero
+    configura_pwm_M2_PE5();//motor izquierdo delantero
+    configura_pwm_M3_PB6();//motor derecho trasero
+    configura_pwm_M4_PB7();//motor izquierdo trasero
+
+    Config_Sentido_Giro();
+
+    GPIO_PORTA_DATA_R &= ~(1<<3);//motor derecho delantero
+    GPIO_PORTA_DATA_R &= ~(1<<5);//motor izquierdo delantero
+    GPIO_PORTA_DATA_R &= ~(1<<7);//motor derecho trasero
+    GPIO_PORTD_DATA_R &= ~(1<<7);//motor izquierdo trasero
+    char c;
+    config_UART3();
+    config_pulsador_led();
+    while(1){
+
+        c =  rxcar_uart3();//dato recibido por el módulo bluetooth
+        switch(c){
+
+        case 'r':
+            GPIO_PORTF_DATA_R |= MAGENTA;//se enciende el led magenta
+            Motor_der_90();//se gira a la derecha
+            delay(80);
+            break;
+        case 'g':
+            GPIO_PORTF_DATA_R |= CIAN;//se enciende el led cian
+            Motor_izq_90();//se gira a la izquierda
+            delay(80);
+            break;
+        case 'z':
+            GPIO_PORTF_DATA_R &= ~(0x0E);//se apagan los leds
+            Motor_apagado();//se detienen los motores
+            delay(80);
+            break;
+        case 'v':
+            GPIO_PORTF_DATA_R |= AMARILLO;//se enciende el led amarillo
+            Motor_avanzar();//el vehículo avanza
+            delay(80);
+            break;
+        default:
+            GPIO_PORTF_DATA_R &= ~(0x0E);//se apagan los leds
+            Motor_apagado();//se detienen los motores
+            delay(80);
+            break;
+        }
+
+    }
+}
